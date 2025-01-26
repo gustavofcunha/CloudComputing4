@@ -106,3 +106,5 @@ parquet_time = measure_load_time(gold_playlist_info_parquet, "parquet")
 
 print(f"JSON load time: {json_time:.2f} seconds")
 print(f"Parquet load time: {parquet_time:.2f} seconds")
+
+spark.stop()
