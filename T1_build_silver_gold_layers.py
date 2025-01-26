@@ -71,7 +71,7 @@ gold_playlist_info_df = playlist_tracks_df.groupBy("playlist_id").agg(
 ).join(playlist_info_df, "playlist_id", "inner")
 
 gold_playlist_tracks_df = playlist_tracks_df.join(
-    song_info_df.select("track_uri", "name", "album_uri", "artist_uri"),
+    song_info_df.select("track_uri", col("name").alias("song_name"), "album_uri", "artist_uri"),
     "track_uri",
     "inner"
 ).join(
@@ -83,7 +83,7 @@ gold_playlist_tracks_df = playlist_tracks_df.join(
     "artist_uri",
     "inner"
 ).select(
-    "playlist_id", "position", "name", "album_name", "artist_name"
+    "playlist_id", "position", "song_name", "album_name", "artist_name"
 )
 
 gold_playlist_info_df.write.format("parquet").mode("overwrite").save("datalake/gold/playlist_info")
