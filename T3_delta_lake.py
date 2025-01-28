@@ -1,10 +1,15 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, row_number
-from pyspark.sql.window import Window
+from pyspark.sql.functions import col, when
+from time import time
 import os
-import time
 
-# Inicializa a sessão Spark
+playlists_v1_path = '/shared/sampled/playlists_v1.json'
+tracks_v1_path = '/shared/sampled/tracks_v1.json'
+playlists_v2_path = '/shared/sampled/playlists_v2.json'
+tracks_v2_path = '/shared/sampled/tracks_v2.json'
+playlists_v3_path = '/shared/sampled/playlists_v3.json'
+tracks_v3_path = '/shared/sampled/tracks_v3.json'
+
 spark = SparkSession.builder \
     .appName("spotify-datalake") \
     .config("spark.jars.packages", "io.delta:delta-core_2.13:2.4.0") \
@@ -18,102 +23,86 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("WARN")
 
-start_time = time.time()
+start_time = time()
 
-base_path = "/home/gustavocunha/CloudComputing4/deltalake"
-os.makedirs(base_path, exist_ok=True)
+playlists_v1_df = spark.read.json(playlists_v1_path)
+tracks_v1_df = spark.read.json(tracks_v1_path)
+playlists_v2_df = spark.read.json(playlists_v2_path)
+tracks_v2_df = spark.read.json(tracks_v2_path)
+playlists_v3_df = spark.read.json(playlists_v3_path)
+tracks_v3_df = spark.read.json(tracks_v3_path)
 
-# Carrega os dados iniciais
-playlists_v1 = spark.read.json("/shared/sampled/playlists_v1.json")
-tracks_v1 = spark.read.json("/shared/sampled/tracks_v1.json")
-playlists_v2 = spark.read.json("/shared/sampled/playlists_v2.json")
-tracks_v2 = spark.read.json("/shared/sampled/tracks_v2.json")
-playlists_v3 = spark.read.json("/shared/sampled/playlists_v3.json")
-tracks_v3 = spark.read.json("/shared/sampled/tracks_v3.json")
+new_playlists_v2_df = playlists_v2_df.select(
+    col("name").alias("playlist_name"),
+    col("pid").alias("playlist_id"),
+    col("description"),
+    col("collaborative").cast("boolean")
+)
 
-# Escreve os dados iniciais nas tabelas Silver
-playlists_v1.write.format("delta").mode("overwrite").save(f"{base_path}/silver_playlists")
-tracks_v1.write.format("delta").mode("overwrite").save(f"{base_path}/silver_tracks")
-playlists_v1.join(tracks_v1, "pid").write.format("delta").mode("overwrite").save(f"{base_path}/gold")
+new_tracks_v2_df = tracks_v2_df.select(
+    col("pid").alias("playlist_id"),
+    col("pos").alias("position"),
+    col("track_uri"),
+    col("artist_uri"),
+    col("album_uri"),
+    col("duration_ms").alias("duration")
+)
 
-# Função para tratar duplicidade e garantir uma correspondência única
-def deduplicate_and_merge(df, target_path, merge_key, dedup_key):
-    # Cria uma janela para aplicar a deduplicação
-    window_spec = Window.partitionBy(merge_key).orderBy(col(dedup_key).desc())  # Use col() para referenciar a coluna
-    deduplicated_df = df.withColumn("row_number", row_number().over(window_spec)) \
-                        .filter(col("row_number") == 1) \
-                        .drop("row_number")
-    return deduplicated_df
+new_playlists_v3_df = playlists_v3_df.select(
+    col("name").alias("playlist_name"),
+    col("pid").alias("playlist_id"),
+    col("description"),
+    col("collaborative").cast("boolean")
+)
 
-# Atualiza a tabela Silver com playlists_v2
-playlists_v2_dedup = deduplicate_and_merge(playlists_v2, f"{base_path}/silver_playlists", "pid", "modified")
-playlists_v2_dedup.createOrReplaceTempView("playlists_v2_temp")
-spark.sql(f"""
-MERGE INTO delta.`{base_path}/silver_playlists` t
-USING playlists_v2_temp s
-ON t.pid = s.pid
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
-""")
+new_tracks_v3_df = tracks_v3_df.select(
+    col("pid").alias("playlist_id"),
+    col("pos").alias("position"),
+    col("track_uri"),
+    col("artist_uri"),
+    col("album_uri"),
+    col("duration_ms").alias("duration")
+)
 
-# Atualiza a tabela Silver com tracks_v2
-tracks_v2_dedup = deduplicate_and_merge(tracks_v2, f"{base_path}/silver_tracks", "track_uri", "duration_ms")
-tracks_v2_dedup.createOrReplaceTempView("tracks_v2_temp")
-spark.sql(f"""
-MERGE INTO delta.`{base_path}/silver_tracks` t
-USING tracks_v2_temp s
-ON t.track_uri = s.track_uri
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
-""")
+delta_path = "datalake/delta"
+playlist_info_df = spark.createDataFrame([], new_playlists_v2_df.schema)
+playlist_tracks_df = spark.createDataFrame([], new_tracks_v2_df.schema)
 
-# Atualiza playlists específicas na tabela Silver
-silver_playlists = spark.read.format("delta").load(f"{base_path}/silver_playlists")
-updated_playlists = silver_playlists.filter(col("pid") == 11992).withColumn("modified", col("modified") + 1)
-updated_playlists.createOrReplaceTempView("updated_playlists")
-spark.sql(f"""
-MERGE INTO delta.`{base_path}/silver_playlists` t
-USING updated_playlists s
-ON t.pid = s.pid
-WHEN MATCHED THEN UPDATE SET *
-""")
+playlist_info_df = playlist_info_df.unionByName(new_playlists_v2_df, allowMissingColumns=True).dropDuplicates(["playlist_id"])
 
-# Atualiza a tabela Silver com playlists_v3
-playlists_v3_dedup = deduplicate_and_merge(playlists_v3, f"{base_path}/silver_playlists", "pid", "modified")
-playlists_v3_dedup.createOrReplaceTempView("playlists_v3_temp")
-spark.sql(f"""
-MERGE INTO delta.`{base_path}/silver_playlists` t
-USING playlists_v3_temp s
-ON t.pid = s.pid
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
-""")
+update_playlist_df = spark.createDataFrame([(11992, "GYM WORKOUT", True)], ["playlist_id", "playlist_name", "collaborative"])
+update_playlist_df = update_playlist_df.withColumn("collaborative", col("collaborative").cast("boolean"))
 
-# Atualiza a tabela Silver com tracks_v3
-tracks_v3_dedup = deduplicate_and_merge(tracks_v3, f"{base_path}/silver_tracks", "track_uri", "duration_ms")
-tracks_v3_dedup.createOrReplaceTempView("tracks_v3_temp")
-spark.sql(f"""
-MERGE INTO delta.`{base_path}/silver_tracks` t
-USING tracks_v3_temp s
-ON t.track_uri = s.track_uri
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
-""")
+playlist_info_df = playlist_info_df.alias("playlist_info").join(update_playlist_df.alias("update_playlist"), "playlist_id", "left").select(
+    "playlist_info.playlist_id",
+    when(col("update_playlist.playlist_name").isNotNull(), col("update_playlist.playlist_name")).otherwise(col("playlist_info.playlist_name")).alias("playlist_name"),
+    when(col("update_playlist.collaborative").isNotNull(), col("update_playlist.collaborative")).otherwise(col("playlist_info.collaborative")).alias("collaborative"),
+    "playlist_info.description"
+)
 
-# Atualiza a tabela Gold
-silver_playlists = spark.read.format("delta").load(f"{base_path}/silver_playlists")
-silver_tracks = spark.read.format("delta").load(f"{base_path}/silver_tracks")
-silver_playlists.join(silver_tracks, "pid").write.format("delta").mode("overwrite").save(f"{base_path}/gold")
+playlist_info_df = playlist_info_df.unionByName(new_playlists_v3_df, allowMissingColumns=True).dropDuplicates(["playlist_id"])
 
-# Calcula métricas de tamanho e tempo
-end_time = time.time()
-elapsed_time = end_time - start_time
+playlist_tracks_df = playlist_tracks_df.alias("old").join(new_tracks_v3_df.alias("new"), 
+    (col("old.playlist_id") == col("new.playlist_id")) & 
+    (col("old.position") == col("new.position")), 
+    "outer"
+).select(
+    when(col("new.playlist_id").isNotNull(), col("new.playlist_id")).otherwise(col("old.playlist_id")).alias("playlist_id"),
+    when(col("new.position").isNotNull(), col("new.position")).otherwise(col("old.position")).alias("position"),
+    when(col("new.track_uri").isNotNull(), col("new.track_uri")).otherwise(col("old.track_uri")).alias("track_uri"),
+    when(col("new.artist_uri").isNotNull(), col("new.artist_uri")).otherwise(col("old.artist_uri")).alias("artist_uri"),
+    when(col("new.album_uri").isNotNull(), col("new.album_uri")).otherwise(col("old.album_uri")).alias("album_uri"),
+    when(col("new.duration").isNotNull(), col("new.duration")).otherwise(col("old.duration")).alias("duration")
+).dropDuplicates(["playlist_id", "position"])
 
-parquet_size = sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, filenames in os.walk('/shared/sampled/') for f in filenames if f.endswith('.json'))
-delta_size = sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, filenames in os.walk(base_path) for f in filenames)
+playlist_info_df.write.format("delta").mode("overwrite").save(f"{delta_path}/playlist_info")
+playlist_tracks_df.write.format("delta").mode("overwrite").save(f"{delta_path}/playlist_tracks")
 
-print(f"Elapsed time: {elapsed_time:.2f} seconds")
-print(f"Parquet size: {parquet_size / (1024 * 1024):.2f} MB")
-print(f"Delta size: {delta_size / (1024 * 1024):.2f} MB")
+total_time = time() - start_time
+
+storage_size = sum(os.path.getsize(os.path.join(root, file)) for root, dirs, files in os.walk(delta_path) for file in files)
+
+print(f"Total time for operations (load v1, merge v2, apply update, and merge v3): {total_time:.2f} seconds")
+print(f"Total space used by Delta Lake: {storage_size / (1024 * 1024):.2f} MB")
 
 spark.stop()
