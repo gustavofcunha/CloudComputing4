@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when
-from time import time
+from pyspark.sql.functions import col, coalesce, when, count, countDistinct, sum
 import os
+from time import time
 
 playlists_v1_path = '/shared/sampled/playlists_v1.json'
 tracks_v1_path = '/shared/sampled/tracks_v1.json'
@@ -25,6 +25,7 @@ spark.sparkContext.setLogLevel("WARN")
 
 start_time = time()
 
+# Read all versions
 playlists_v1_df = spark.read.json(playlists_v1_path)
 tracks_v1_df = spark.read.json(tracks_v1_path)
 playlists_v2_df = spark.read.json(playlists_v2_path)
@@ -32,77 +33,134 @@ tracks_v2_df = spark.read.json(tracks_v2_path)
 playlists_v3_df = spark.read.json(playlists_v3_path)
 tracks_v3_df = spark.read.json(tracks_v3_path)
 
-new_playlists_v2_df = playlists_v2_df.select(
+# Silver Zone tables
+song_info_df = tracks_v2_df.select(
+    col("track_name").alias("song_name"),
+    col("track_uri"),
+    col("duration_ms").cast("long").alias("duration"),  
+    col("album_uri"),
+    col("artist_uri")
+)
+
+album_info_df = tracks_v2_df.select(
+    col("album_name"),
+    col("album_uri"),
+    col("track_uri"),
+    col("artist_uri")
+)
+
+artist_info_df = tracks_v2_df.select(
+    col("artist_name").alias("artist_name"),
+    col("artist_uri")
+)
+
+playlist_info_df = playlists_v2_df.select(
     col("name").alias("playlist_name"),
     col("pid").alias("playlist_id"),
     col("description"),
     col("collaborative").cast("boolean")
 )
 
-new_tracks_v2_df = tracks_v2_df.select(
+playlist_tracks_df = tracks_v2_df.select(
     col("pid").alias("playlist_id"),
     col("pos").alias("position"),
     col("track_uri"),
     col("artist_uri"),
+    col("artist_name"),
     col("album_uri"),
-    col("duration_ms").alias("duration")
+    col("album_name"),
+    col("duration_ms").cast("long").alias("duration")  # Ensure duration is long
 )
 
-new_playlists_v3_df = playlists_v3_df.select(
+# Gold Zone tables
+gold_playlist_info_df = playlist_info_df.join(
+    playlist_tracks_df.groupBy("playlist_id")
+    .agg(
+        count("track_uri").alias("number_of_tracks"),
+        countDistinct("artist_uri").alias("number_of_artists"),
+        countDistinct("album_uri").alias("number_of_albums"),
+        sum("duration").alias("total_duration")  # Sum duration as long
+    ),
+    "playlist_id"
+)
+
+gold_playlist_tracks_df = playlist_tracks_df.join(
+    song_info_df, "track_uri", "inner"
+).select(
+    "playlist_id",
+    "position",
+    "song_name",
+    "album_name",
+    "artist_name"
+)
+
+delta_path = "deltalake"
+silver_path = f"{delta_path}/silver"
+gold_path = f"{delta_path}/gold"
+
+song_info_df.write.format("delta").mode("overwrite").save(f"{silver_path}/song_info")
+album_info_df.write.format("delta").mode("overwrite").save(f"{silver_path}/album_info")
+artist_info_df.write.format("delta").mode("overwrite").save(f"{silver_path}/artist_info")
+playlist_info_df.write.format("delta").mode("overwrite").save(f"{silver_path}/playlist_info")
+playlist_tracks_df.write.format("delta").mode("overwrite").save(f"{silver_path}/playlist_tracks")
+
+gold_playlist_info_df.write.format("delta").mode("overwrite").save(f"{gold_path}/gold_playlist_info")
+gold_playlist_tracks_df.write.format("delta").mode("overwrite").save(f"{gold_path}/gold_playlist_tracks")
+
+playlist_info_v1_df = spark.read.format("delta").load(f"{silver_path}/playlist_info")
+playlist_tracks_v1_df = spark.read.format("delta").load(f"{silver_path}/playlist_tracks")
+
+playlist_info_v2_df = playlists_v2_df.select(
     col("name").alias("playlist_name"),
     col("pid").alias("playlist_id"),
     col("description"),
     col("collaborative").cast("boolean")
 )
 
-new_tracks_v3_df = tracks_v3_df.select(
-    col("pid").alias("playlist_id"),
-    col("pos").alias("position"),
-    col("track_uri"),
-    col("artist_uri"),
-    col("album_uri"),
-    col("duration_ms").alias("duration")
-)
-
-delta_path = "datalake/delta"
-playlist_info_df = spark.createDataFrame([], new_playlists_v2_df.schema)
-playlist_tracks_df = spark.createDataFrame([], new_tracks_v2_df.schema)
-
-playlist_info_df = playlist_info_df.unionByName(new_playlists_v2_df, allowMissingColumns=True).dropDuplicates(["playlist_id"])
-
-update_playlist_df = spark.createDataFrame([(11992, "GYM WORKOUT", True)], ["playlist_id", "playlist_name", "collaborative"])
-update_playlist_df = update_playlist_df.withColumn("collaborative", col("collaborative").cast("boolean"))
-
-playlist_info_df = playlist_info_df.alias("playlist_info").join(update_playlist_df.alias("update_playlist"), "playlist_id", "left").select(
-    "playlist_info.playlist_id",
-    when(col("update_playlist.playlist_name").isNotNull(), col("update_playlist.playlist_name")).otherwise(col("playlist_info.playlist_name")).alias("playlist_name"),
-    when(col("update_playlist.collaborative").isNotNull(), col("update_playlist.collaborative")).otherwise(col("playlist_info.collaborative")).alias("collaborative"),
-    "playlist_info.description"
-)
-
-playlist_info_df = playlist_info_df.unionByName(new_playlists_v3_df, allowMissingColumns=True).dropDuplicates(["playlist_id"])
-
-playlist_tracks_df = playlist_tracks_df.alias("old").join(new_tracks_v3_df.alias("new"), 
-    (col("old.playlist_id") == col("new.playlist_id")) & 
-    (col("old.position") == col("new.position")), 
+playlist_info_merged_df = playlist_info_v1_df.alias("v1").join(
+    playlist_info_v2_df.alias("v2"),
+    "playlist_id",
     "outer"
 ).select(
-    when(col("new.playlist_id").isNotNull(), col("new.playlist_id")).otherwise(col("old.playlist_id")).alias("playlist_id"),
-    when(col("new.position").isNotNull(), col("new.position")).otherwise(col("old.position")).alias("position"),
-    when(col("new.track_uri").isNotNull(), col("new.track_uri")).otherwise(col("old.track_uri")).alias("track_uri"),
-    when(col("new.artist_uri").isNotNull(), col("new.artist_uri")).otherwise(col("old.artist_uri")).alias("artist_uri"),
-    when(col("new.album_uri").isNotNull(), col("new.album_uri")).otherwise(col("old.album_uri")).alias("album_uri"),
-    when(col("new.duration").isNotNull(), col("new.duration")).otherwise(col("old.duration")).alias("duration")
-).dropDuplicates(["playlist_id", "position"])
+    coalesce("v2.playlist_name", "v1.playlist_name").alias("playlist_name"),
+    coalesce("v2.playlist_id", "v1.playlist_id").alias("playlist_id"),
+    coalesce("v2.description", "v1.description").alias("description"),
+    coalesce("v2.collaborative", "v1.collaborative").alias("collaborative")
+)
 
-playlist_info_df.write.format("delta").mode("overwrite").save(f"{delta_path}/playlist_info")
-playlist_tracks_df.write.format("delta").mode("overwrite").save(f"{delta_path}/playlist_tracks")
+playlist_info_updated_df = playlist_info_merged_df.withColumn(
+    "playlist_name",
+    when(col("playlist_id") == 11992, "Updated Playlist Name").otherwise(col("playlist_name"))
+)
+
+playlist_info_v3_df = playlists_v3_df.select(
+    col("name").alias("playlist_name"),
+    col("pid").alias("playlist_id"),
+    col("description"),
+    col("collaborative").cast("boolean")
+)
+
+playlist_info_final_df = playlist_info_updated_df.alias("v2").join(
+    playlist_info_v3_df.alias("v3"),
+    "playlist_id",
+    "outer"
+).select(
+    coalesce("v3.playlist_name", "v2.playlist_name").alias("playlist_name"),
+    coalesce("v3.playlist_id", "v2.playlist_id").alias("playlist_id"),
+    coalesce("v3.description", "v2.description").alias("description"),
+    coalesce("v3.collaborative", "v2.collaborative").alias("collaborative")
+)
+
+playlist_info_final_df.write.format("delta").mode("overwrite").save(f"{silver_path}/playlist_info")
 
 total_time = time() - start_time
 
-storage_size = sum(os.path.getsize(os.path.join(root, file)) for root, dirs, files in os.walk(delta_path) for file in files)
+storage_size = 0
+for root, dirs, files in os.walk(delta_path):
+    for file in files:
+        storage_size += os.path.getsize(os.path.join(root, file))
 
-print(f"Total time for operations (load v1, merge v2, apply update, and merge v3): {total_time:.2f} seconds")
+print(f"Total time for operations: {total_time:.2f} seconds")
 print(f"Total space used by Delta Lake: {storage_size / (1024 * 1024):.2f} MB")
 
 spark.stop()
