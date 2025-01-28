@@ -14,15 +14,15 @@ def print_top_10_from_layer(layer_path, layer_name):
 # Caminhos para as camadas (Bronze, Silver e Gold)
 layers = {
     "silver": {
-        "playlist_info": "datalake/silver/playlist_info",
-        "playlist_tracks": "datalake/silver/playlist_tracks",
-        "song_info": "datalake/silver/song_info",
-        "album_info": "datalake/silver/album_info",
-        "artist_info": "datalake/silver/artist_info"
+        "playlist_info": "deltalake/silver/playlist_info",
+        "playlist_tracks": "deltalake/silver/playlist_tracks",
+        "song_info": "deltalake/silver/song_info",
+        "album_info": "deltalake/silver/album_info",
+        "artist_info": "deltalake/silver/artist_info"
     },
     "gold": {
-        "playlist_info": "datalake/gold/playlist_info",
-        "playlist_tracks": "datalake/gold/playlist_tracks"
+        "playlist_info": "deltalake/gold/playlist_info",
+        "playlist_tracks": "deltalake/gold/playlist_tracks"
     }
 }
 
