@@ -1,5 +1,10 @@
+import time
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, countDistinct, sum, when
+
+# Inicia a contagem do tempo
+start_time = time.time()
 
 playlists_v2_path = '/shared/sampled/playlists_v2.json'
 tracks_v2_path = '/shared/sampled/tracks_v2.json'
@@ -37,7 +42,7 @@ new_playlists_df = playlists_v2_df.select(
 
 playlist_info_df = playlist_info_df.unionByName(new_playlists_df, allowMissingColumns=True).dropDuplicates(["playlist_id"])
 
-update_playlist_df = spark.createDataFrame([
+update_playlist_df = spark.createDataFrame([ 
     (11992, "GYM WORKOUT", True)
 ], ["playlist_id", "playlist_name", "collaborative"])
 
@@ -70,7 +75,6 @@ playlist_tracks_df = playlist_tracks_df.alias("old").join(new_tracks_df.alias("n
     when(col("new.duration").isNotNull(), col("new.duration")).otherwise(col("old.duration")).alias("duration")
 ).dropDuplicates(["playlist_id", "position"])
 
-
 new_song_info_df = tracks_v2_df.select(
     col("track_name"),
     col("track_uri"),
@@ -95,13 +99,11 @@ song_info_df = song_info_df.unionByName(new_song_info_df, allowMissingColumns=Tr
 album_info_df = album_info_df.unionByName(new_album_info_df, allowMissingColumns=True).dropDuplicates(["album_uri"])
 artist_info_df = artist_info_df.unionByName(new_artist_info_df, allowMissingColumns=True).dropDuplicates(["artist_uri"])
 
-
 playlist_info_df.write.format("delta").mode("overwrite").save("datalake/silver/playlist_info")
 playlist_tracks_df.write.format("delta").mode("overwrite").save("datalake/silver/playlist_tracks")
 song_info_df.write.format("delta").mode("overwrite").save("datalake/silver/song_info")
 album_info_df.write.format("delta").mode("overwrite").save("datalake/silver/album_info")
 artist_info_df.write.format("delta").mode("overwrite").save("datalake/silver/artist_info")
-
 
 gold_playlist_info_df = playlist_tracks_df.groupBy("playlist_id").agg(
     countDistinct("track_uri").alias("number_of_tracks"),
@@ -128,5 +130,21 @@ gold_playlist_tracks_df = playlist_tracks_df.join(
 
 gold_playlist_info_df.write.format("parquet").mode("overwrite").save("datalake/gold/playlist_info")
 gold_playlist_tracks_df.write.format("parquet").mode("overwrite").save("datalake/gold/playlist_tracks")
+
+end_time = time.time()
+execution_time = end_time - start_time
+print(f"Tempo total de execução: {execution_time:.2f} segundos")
+
+def get_directory_size(path):
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            file_path = os.path.join(dirpath, filename)
+            total_size += os.path.getsize(file_path)
+    return total_size
+
+datalake_path = "datalake"
+datalake_size = get_directory_size(datalake_path)
+print(f"Tamanho total da pasta 'datalake': {datalake_size / (1024 * 1024):.2f} MB")
 
 spark.stop()
